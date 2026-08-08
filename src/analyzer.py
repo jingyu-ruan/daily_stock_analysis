@@ -3578,6 +3578,24 @@ class GeminiAnalyzer:
                         model_used = exc.last_model
                         llm_usage = exc.last_usage
                     else:
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            current_prompt = self._build_json_retry_prompt(
+                                prompt,
+                                "empty_response",
+                                report_language=report_language,
+                            )
+                            logger.warning(
+                                "[LLM JSON] %s(%s): empty response, 第 %d 次结构化输出重试",
+                                name,
+                                code,
+                                retry_count,
+                            )
+                            _emit_progress(
+                                min(99, 92 + retry_count * 2),
+                                f"{name}：LLM 返回为空，正在重试结构化输出（{retry_count}/{max_retries}）",
+                            )
+                            continue
                         raise
                 elapsed = time.time() - start_time
 
@@ -3606,6 +3624,34 @@ class GeminiAnalyzer:
                 result.model_used = model_used
                 result.report_language = report_language
                 normalize_chip_structure_availability(result, context.get("chip"))
+
+                # JSON 解析失败时只对当前股票重试，避免一个标的失败后直接从邮件中消失。
+                if not result.success:
+                    if retry_count < max_retries:
+                        retry_count += 1
+                        current_prompt = self._build_json_retry_prompt(
+                            prompt,
+                            result.error_message or "invalid_json",
+                            report_language=report_language,
+                        )
+                        logger.warning(
+                            "[LLM JSON] %s(%s): 解析失败，第 %d 次结构化输出重试: %s",
+                            name,
+                            code,
+                            retry_count,
+                            result.error_message or "invalid_json",
+                        )
+                        _emit_progress(
+                            min(99, 92 + retry_count * 2),
+                            f"{name}：JSON 解析失败，正在重试结构化输出（{retry_count}/{max_retries}）",
+                        )
+                        continue
+                    logger.warning(
+                        "[LLM JSON] %s(%s): 结构化输出重试耗尽，保留失败结果",
+                        name,
+                        code,
+                    )
+                    break
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:
@@ -4362,6 +4408,32 @@ class GeminiAnalyzer:
             previous_output,
             complement,
         ])
+
+    def _build_json_retry_prompt(
+        self,
+        base_prompt: str,
+        failure_reason: str,
+        report_language: str = "zh",
+    ) -> str:
+        """Build a compact retry prompt for empty or malformed structured output."""
+        report_language = normalize_report_language(report_language)
+        reason = str(failure_reason or "invalid_json").strip().replace("\n", " ")[:200]
+        if report_language in ("en", "ko"):
+            instruction = (
+                "### Structured output retry\n"
+                f"The previous model response could not be parsed ({reason}). "
+                "Regenerate the complete analysis from the data above. "
+                "Return exactly one valid JSON object. Start with { and end with }. "
+                "Do not use Markdown fences, do not add explanations, and do not output a second JSON object."
+            )
+        else:
+            instruction = (
+                "### 结构化输出重试\n"
+                f"上一次模型响应无法解析（{reason}）。请根据上面的数据重新生成完整分析。"
+                "只返回一个有效 JSON 对象，必须以 { 开头、以 } 结尾。"
+                "不要使用 Markdown 代码块，不要附加解释，也不要输出第二个 JSON 对象。"
+            )
+        return "\n\n".join([base_prompt, instruction])
 
     def _apply_placeholder_fill(self, result: AnalysisResult, missing_fields: List[str]) -> None:
         """Delegate to module-level apply_placeholder_fill."""
