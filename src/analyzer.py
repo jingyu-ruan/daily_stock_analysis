@@ -3558,12 +3558,17 @@ class GeminiAnalyzer:
             while True:
                 start_time = time.time()
                 try:
+                    attempt_generation_config = dict(generation_config)
+                    if retry_count:
+                        # 重试时降低随机性，优先保证 JSON 可解析。
+                        attempt_generation_config["temperature"] = 0.1
                     response_text, model_used, llm_usage = self._call_litellm(
                         current_prompt,
-                        generation_config,
+                        attempt_generation_config,
                         system_prompt=system_prompt,
-                        stream=True,
-                        stream_progress_callback=stream_progress_callback,
+                        # 分析结果必须是完整 JSON，避免流式响应被截断或返回空内容。
+                        stream=False,
+                        stream_progress_callback=None,
                         response_validator=self._validate_json_response,
                         audit_context=legacy_audit_context,
                     )
@@ -3595,6 +3600,7 @@ class GeminiAnalyzer:
                                 min(99, 92 + retry_count * 2),
                                 f"{name}：LLM 返回为空，正在重试结构化输出（{retry_count}/{max_retries}）",
                             )
+                            time.sleep(min(1.5 * retry_count, 4.0))
                             continue
                         raise
                 elapsed = time.time() - start_time
@@ -3645,6 +3651,7 @@ class GeminiAnalyzer:
                             min(99, 92 + retry_count * 2),
                             f"{name}：JSON 解析失败，正在重试结构化输出（{retry_count}/{max_retries}）",
                         )
+                        time.sleep(min(1.5 * retry_count, 4.0))
                         continue
                     logger.warning(
                         "[LLM JSON] %s(%s): 结构化输出重试耗尽，保留失败结果",
@@ -3681,6 +3688,8 @@ class GeminiAnalyzer:
                         retry_progress,
                         f"{name}：报告字段不完整，正在补全重试（{retry_count}/{max_retries}）",
                     )
+                    time.sleep(min(1.5 * retry_count, 4.0))
+                    continue
                 else:
                     self._apply_placeholder_fill(result, missing_fields)
                     logger.warning(
