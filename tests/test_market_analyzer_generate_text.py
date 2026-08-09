@@ -1542,6 +1542,90 @@ class TestAnalyzerGenerateText:
         assert text == expected
         assert model_used == "openai/MiniMax-M3"
 
+    @pytest.mark.parametrize(
+        ("configured_model", "model_list"),
+        [
+            ("deepseek/deepseek-v4-flash", []),
+            (
+                "daily-deepseek",
+                [
+                    {
+                        "model_name": "daily-deepseek",
+                        "litellm_params": {
+                            "model": "deepseek/deepseek-v4-flash",
+                            "api_key": "sk-deepseek-testkey",
+                        },
+                    }
+                ],
+            ),
+        ],
+        ids=["direct", "router-alias"],
+    )
+    def test_deepseek_v4_structured_analysis_uses_native_json_non_thinking_mode(
+        self,
+        configured_model,
+        model_list,
+    ):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model=configured_model,
+            litellm_fallback_models=[],
+            llm_model_list=model_list,
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"sentiment_score": 72}')
+                )
+            ],
+            usage=None,
+        )
+
+        with patch.object(
+            analyzer,
+            "_dispatch_litellm_completion",
+            return_value=response,
+        ) as mock_dispatch:
+            text, model_used, _usage = analyzer._call_litellm(
+                "Return one JSON object",
+                {"max_tokens": 8192, "temperature": 0.2},
+                response_validator=analyzer._validate_json_response,
+            )
+
+        assert text == '{"sentiment_score": 72}'
+        assert model_used == configured_model
+        call_kwargs = mock_dispatch.call_args.args[1]
+        assert call_kwargs["response_format"] == {"type": "json_object"}
+        assert call_kwargs["extra_body"]["thinking"] == {"type": "disabled"}
+
+    def test_deepseek_v4_free_form_call_keeps_provider_defaults(self):
+        analyzer = self._make_analyzer()
+        analyzer._config_override = SimpleNamespace(
+            litellm_model="deepseek/deepseek-v4-flash",
+            litellm_fallback_models=[],
+            llm_model_list=[],
+        )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="market review"))],
+            usage=None,
+        )
+
+        with patch.object(
+            analyzer,
+            "_dispatch_litellm_completion",
+            return_value=response,
+        ) as mock_dispatch:
+            text, model_used, _usage = analyzer._call_litellm(
+                "Write a market review",
+                {"max_tokens": 512, "temperature": 0.2},
+            )
+
+        assert text == "market review"
+        assert model_used == "deepseek/deepseek-v4-flash"
+        call_kwargs = mock_dispatch.call_args.args[1]
+        assert "response_format" not in call_kwargs
+        assert "extra_body" not in call_kwargs
+
     def test_call_litellm_minimax_stream_ignores_reasoning_blocks(self):
         analyzer = self._make_analyzer()
         analyzer._config_override = SimpleNamespace(
@@ -2232,7 +2316,7 @@ class TestAnalyzerGenerateText:
         assert "补全重试" in progress_updates[2][1]
         assert "解析 JSON" in progress_updates[3][1]
 
-    def test_analyze_persists_provider_usage_from_private_stream_hidden_usage_best_effort(self):
+    def test_analyze_persists_provider_usage_from_private_hidden_usage_best_effort(self):
         analyzer = self._make_analyzer()
         analyzer._config_override = SimpleNamespace(
             gemini_request_delay=0,
@@ -2256,25 +2340,28 @@ class TestAnalyzerGenerateText:
             analysis_summary="分析结果",
         )
 
-        def stream_response():
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content='{"sentiment_score":80}'))],
-                usage=None,
-            )
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content=""))],
-                usage=None,
-                _hidden_params={
-                    "usage": SimpleNamespace(prompt_tokens=11, completion_tokens=2, total_tokens=13)
-                },
-            )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"sentiment_score":80}')
+                )
+            ],
+            usage=None,
+            _hidden_params={
+                "usage": SimpleNamespace(
+                    prompt_tokens=11,
+                    completion_tokens=2,
+                    total_tokens=13,
+                )
+            },
+        )
 
         with patch.object(analyzer, "is_available", return_value=True), \
              patch.object(analyzer, "_get_analysis_system_prompt", return_value="system"), \
              patch.object(analyzer, "_get_skill_prompt_sections", return_value=("RSI skill raw", "Default skill policy", False)), \
              patch.object(analyzer, "_format_prompt", return_value="prompt"), \
              patch.object(analyzer, "_validate_json_response"), \
-             patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()), \
+             patch.object(analyzer, "_dispatch_litellm_completion", return_value=response), \
              patch.object(analyzer, "_parse_response", return_value=parsed_result), \
              patch.object(analyzer, "_build_market_snapshot", return_value={}), \
              patch("src.analyzer.persist_llm_usage") as mock_usage:
@@ -2322,11 +2409,18 @@ class TestAnalyzerGenerateText:
             analysis_summary="分析结果",
         )
 
-        def stream_response():
-            yield SimpleNamespace(
-                choices=[SimpleNamespace(delta=SimpleNamespace(content='{"sentiment_score":80}'))],
-                usage=SimpleNamespace(prompt_tokens=42, completion_tokens=3, total_tokens=45),
-            )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content='{"sentiment_score":80}')
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=42,
+                completion_tokens=3,
+                total_tokens=45,
+            ),
+        )
 
         context = {
             "code": "600519",
@@ -2356,7 +2450,7 @@ class TestAnalyzerGenerateText:
              patch.object(analyzer, "_get_analysis_system_prompt", return_value="system"), \
              patch.object(analyzer, "_get_skill_prompt_sections", return_value=("RSI skill raw", "Default skill policy", False)), \
              patch.object(analyzer, "_validate_json_response"), \
-             patch.object(analyzer, "_dispatch_litellm_completion", return_value=stream_response()), \
+             patch.object(analyzer, "_dispatch_litellm_completion", return_value=response), \
              patch.object(analyzer, "_parse_response", return_value=parsed_result), \
              patch.object(analyzer, "_build_market_snapshot", return_value={}), \
              patch("src.analyzer.persist_llm_usage") as mock_usage:

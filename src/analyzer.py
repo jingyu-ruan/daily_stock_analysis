@@ -49,7 +49,10 @@ from src.llm.hermes import (
     route_has_hermes,
     sanitize_hermes_error_text,
 )
-from src.llm.generation_params import apply_litellm_generation_params
+from src.llm.generation_params import (
+    apply_litellm_generation_params,
+    resolve_litellm_wire_model,
+)
 from src.llm.errors import call_litellm_with_param_recovery
 from src.llm.backend_registry import (
     LOCAL_CLI_GENERATION_BACKEND_IDS,
@@ -3193,6 +3196,26 @@ class GeminiAnalyzer:
                         call_kwargs.update(extra_litellm_params(model, config))
                     except AttributeError:
                         pass
+
+                # DeepSeek V4 enables thinking by default.  On a parser-bound
+                # analysis response, thinking wastes output budget and can
+                # leave the final JSON empty or truncated.  Use the
+                # provider's native JSON mode and explicitly request the
+                # non-thinking path for this structured call only.
+                wire_model = resolve_litellm_wire_model(model, recovery_model_list)
+                wire_model_name = wire_model.rsplit("/", 1)[-1].lower()
+                if (
+                    response_validator is not None
+                    and wire_model_name in {"deepseek-v4-flash", "deepseek-v4-pro"}
+                ):
+                    structured_extra_body = dict(call_kwargs.get("extra_body") or {})
+                    structured_extra_body["thinking"] = {"type": "disabled"}
+                    call_kwargs["extra_body"] = structured_extra_body
+                    call_kwargs["response_format"] = {"type": "json_object"}
+                    logger.info(
+                        "[LiteLLM] %s structured output uses json_object with thinking disabled",
+                        model,
+                    )
                 call_kwargs = apply_litellm_generation_params(
                     call_kwargs,
                     model,
@@ -3658,7 +3681,10 @@ class GeminiAnalyzer:
                         name,
                         code,
                     )
-                    break
+                    if not config.report_integrity_enabled:
+                        break
+                    # Keep the failed result visibly well-shaped for report
+                    # rendering, while preserving success=False and its error.
 
                 # 内容完整性校验（可选）
                 if not config.report_integrity_enabled:

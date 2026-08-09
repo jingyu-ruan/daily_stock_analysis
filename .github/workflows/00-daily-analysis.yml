@@ -409,8 +409,8 @@ jobs:
           REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'simple' }}
           REPORT_LANGUAGE: ${{ vars.REPORT_LANGUAGE || secrets.REPORT_LANGUAGE || '' }}
           REPORT_SHOW_LLM_MODEL: ${{ vars.REPORT_SHOW_LLM_MODEL || secrets.REPORT_SHOW_LLM_MODEL || 'true' }}
-          # 结构化 JSON 失败时最多额外尝试两轮，仅对失败标的产生额外调用。
-          REPORT_INTEGRITY_RETRY: ${{ vars.REPORT_INTEGRITY_RETRY || secrets.REPORT_INTEGRITY_RETRY || '2' }}
+          # 原生 JSON 模式偶发空响应时仅重试一轮，避免对同一标的放大无效请求。
+          REPORT_INTEGRITY_RETRY: ${{ vars.REPORT_INTEGRITY_RETRY || secrets.REPORT_INTEGRITY_RETRY || '1' }}
           SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
           MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
           ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
