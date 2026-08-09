@@ -3198,6 +3198,7 @@ class StockAnalysisPipeline:
             )
         
         results: List[AnalysisResult] = []
+        failed_results: List[AnalysisResult] = []
         
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
@@ -3230,9 +3231,23 @@ class StockAnalysisPipeline:
                                 fallback_code=code,
                             )
                     elif result and not result.success:
+                        failed_results.append(result)
                         logger.warning(
                             f"[{code}] 分析结果标记为失败，不计入汇总: "
                             f"{result.error_message or '未知原因'}"
+                        )
+                    elif result is None:
+                        failed_results.append(
+                            AnalysisResult(
+                                code=code,
+                                name=code,
+                                sentiment_score=50,
+                                trend_prediction="震荡",
+                                operation_advice="观望",
+                                analysis_summary="分析任务未返回结果",
+                                success=False,
+                                error_message="分析任务未返回结果",
+                            )
                         )
 
                     # Issue #128: 分析间隔 - 在个股分析和大盘分析之间添加延迟
@@ -3246,6 +3261,18 @@ class StockAnalysisPipeline:
 
                 except Exception as e:
                     logger.error(f"[{code}] 任务执行失败: {e}")
+                    failed_results.append(
+                        AnalysisResult(
+                            code=code,
+                            name=code,
+                            sentiment_score=50,
+                            trend_prediction="震荡",
+                            operation_advice="观望",
+                            analysis_summary="分析过程发生异常",
+                            success=False,
+                            error_message=sanitize_diagnostic_text(e, max_length=240),
+                        )
+                    )
         
         # 统计
         elapsed_time = time.time() - start_time
@@ -3270,23 +3297,42 @@ class StockAnalysisPipeline:
         
         logger.info("===== 分析完成 =====")
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
+        if failed_results:
+            logger.warning(
+                "失败股票: %s",
+                ", ".join(str(getattr(item, "code", "unknown")) for item in failed_results),
+            )
         
         # 保存报告到本地文件（无论是否推送通知都保存）
-        if results and not dry_run:
-            self._save_local_report(results, report_type)
+        if (results or failed_results) and not dry_run:
+            self._save_local_report(results, report_type, failed_results=failed_results)
 
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
-        if results and send_notification and not dry_run:
+        if (results or failed_results) and send_notification and not dry_run:
             if single_stock_notify:
                 # 单股推送模式：只保存汇总报告，不再重复推送
                 logger.info("单股推送模式：跳过汇总推送，仅保存报告到本地")
-                self._send_notifications(results, report_type, skip_push=True)
+                self._send_notifications(
+                    results,
+                    report_type,
+                    skip_push=True,
+                    failed_results=failed_results,
+                )
             elif merge_notification:
                 # 合并模式（Issue #190）：仅保存，不推送，由 main 层合并个股+大盘后统一发送
                 logger.info("合并推送模式：跳过本次推送，将在个股+大盘复盘后统一发送")
-                self._send_notifications(results, report_type, skip_push=True)
+                self._send_notifications(
+                    results,
+                    report_type,
+                    skip_push=True,
+                    failed_results=failed_results,
+                )
             else:
-                self._send_notifications(results, report_type)
+                self._send_notifications(
+                    results,
+                    report_type,
+                    failed_results=failed_results,
+                )
         
         return results
 
@@ -3391,10 +3437,12 @@ class StockAnalysisPipeline:
         self,
         results: List[AnalysisResult],
         report_type: ReportType = ReportType.SIMPLE,
+        failed_results: Optional[List[AnalysisResult]] = None,
     ) -> None:
         """保存分析报告到本地文件（与通知推送解耦）"""
         try:
             report = self._generate_aggregate_report(results, report_type)
+            report = self._append_failed_stock_notice(report, failed_results)
             filepath = self.notifier.save_report_to_file(report)
             logger.info(f"决策仪表盘日报已保存: {filepath}")
         except Exception as e:
@@ -3405,6 +3453,7 @@ class StockAnalysisPipeline:
         results: List[AnalysisResult],
         report_type: ReportType = ReportType.SIMPLE,
         skip_push: bool = False,
+        failed_results: Optional[List[AnalysisResult]] = None,
     ) -> None:
         """
         发送分析结果通知
@@ -3420,6 +3469,7 @@ class StockAnalysisPipeline:
         try:
             logger.info("生成决策仪表盘日报...")
             report = self._generate_aggregate_report(results, report_type)
+            report = self._append_failed_stock_notice(report, failed_results)
             
             # 跳过推送（单股推送模式 / 合并模式：报告已由 _save_local_report 保存）
             if skip_push:
@@ -3510,6 +3560,15 @@ class StockAnalysisPipeline:
                     codes_key = ",".join(
                         sorted(str(getattr(result, "code", "") or "") for result in results)
                     )
+                    failed_codes_key = ",".join(
+                        sorted(
+                            str(getattr(result, "code", "") or "")
+                            for result in (failed_results or [])
+                        )
+                    )
+                    codes_key = ",".join(
+                        item for item in (codes_key, failed_codes_key) if item
+                    )
                     noise_key = f"report:aggregate:{report_type_key}:{codes_key}"
                     noise_decision = self.notifier.evaluate_noise_control(
                         report,
@@ -3590,6 +3649,10 @@ class StockAnalysisPipeline:
                             dashboard_content = self.notifier.generate_brief_report(results)
                         else:
                             dashboard_content = self.notifier.generate_wechat_dashboard(results)
+                        dashboard_content = self._append_failed_stock_notice(
+                            dashboard_content,
+                            failed_results,
+                        )
                         logger.info(f"企业微信仪表盘长度: {len(dashboard_content)} 字符")
                         logger.debug(f"企业微信推送内容:\n{dashboard_content}")
                         wechat_image_bytes = None
@@ -3973,3 +4036,36 @@ class StockAnalysisPipeline:
         if report_type == ReportType.BRIEF and hasattr(self.notifier, "generate_brief_report"):
             return self.notifier.generate_brief_report(results)
         return self.notifier.generate_dashboard_report(results)
+
+    @staticmethod
+    def _append_failed_stock_notice(
+        report: str,
+        failed_results: Optional[List[AnalysisResult]],
+    ) -> str:
+        """Append a visible, redacted summary for symbols omitted from the report."""
+        if not failed_results:
+            return report
+
+        lines = [
+            "",
+            "---",
+            "",
+            "## ⚠️ 本轮未完成分析",
+            "",
+            (
+                f"本轮有 {len(failed_results)} 只股票未完成分析。"
+                "这些股票未计入买入、观望、卖出统计，请稍后重试。"
+            ),
+            "",
+        ]
+        for item in failed_results:
+            code = str(getattr(item, "code", "unknown") or "unknown")
+            name = str(getattr(item, "name", "") or code)
+            reason = sanitize_diagnostic_text(
+                getattr(item, "error_message", None),
+                max_length=180,
+            ) or "模型未返回可解析结果"
+            lines.append(f"- **{name} ({code})**：{reason}")
+
+        return f"{report.rstrip()}\n" + "\n".join(lines)
+
